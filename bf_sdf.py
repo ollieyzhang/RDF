@@ -226,6 +226,74 @@ class BPSDF():
             # gradient_value = None
             return sdf_value, gradient_value
 
+    def get_whole_body_per_link_sdf_batch(self,x,pose,theta,model,use_derivative = True, used_links = [0,1,2,3,4,5,6,7,8]):
+        """
+        Get SDF values and gradients for each link separately (instead of just the minimum).
+        
+        Args:
+            x: query points (N,3)
+            pose: base pose transformation (B,4,4)
+            theta: joint angles (B,7)
+            model: trained SDF model dictionary
+            use_derivative: whether to compute gradients
+            used_links: list of link indices to compute SDF for
+            
+        Returns:
+            sdf_per_link: SDF values for each link (B,K,N) where K is number of links
+            gradient_per_link: gradients for each link (B,K,N,3) or None if use_derivative=False
+        """
+        B = len(theta)
+        N = len(x)
+        K = len(used_links)
+        offset = torch.cat([model[i]['offset'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
+        offset = offset.unsqueeze(0).expand(B,K,3).reshape(B*K,3).float()
+        scale = torch.tensor([model[i]['scale'] for i in used_links],device=self.device)
+        scale = scale.unsqueeze(0).expand(B,K).reshape(B*K).float()
+        trans_list = self.robot.get_transformations_each_link(pose,theta)
+
+        fk_trans = torch.cat([t.unsqueeze(1) for t in trans_list],dim=1)[:,used_links,:,:].reshape(-1,4,4) # B,K,4,4
+        x_robot_frame_batch = utils.transform_points(x.float(),torch.linalg.inv(fk_trans).float(),device=self.device) # B*K,N,3
+        x_robot_frame_batch_scaled = x_robot_frame_batch - offset.unsqueeze(1)
+        x_robot_frame_batch_scaled = x_robot_frame_batch_scaled/scale.unsqueeze(-1).unsqueeze(-1) #B*K,N,3
+
+        x_bounded = torch.where(x_robot_frame_batch_scaled>1.0-1e-2,1.0-1e-2,x_robot_frame_batch_scaled)
+        x_bounded = torch.where(x_bounded<-1.0+1e-2,-1.0+1e-2,x_bounded)
+        res_x = x_robot_frame_batch_scaled - x_bounded
+
+        if not use_derivative:
+            phi,_ = self.build_basis_function_from_points(x_bounded.reshape(B*K*N,3), use_derivative=False)
+            phi = phi.reshape(B,K,N,-1).transpose(0,1).reshape(K,B*N,-1) # K,B*N,-1
+            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
+            # sdf
+            sdf = torch.einsum('ijk,ik->ij',phi,weights_near).reshape(K,B,N).transpose(0,1).reshape(B*K,N) # B,K,N
+            sdf = sdf + res_x.norm(dim=-1)
+            sdf = sdf.reshape(B,K,N)
+            sdf_per_link = sdf*scale.reshape(B,K).unsqueeze(-1)
+            return sdf_per_link, None
+        else:   
+            phi,dphi = self.build_basis_function_from_points(x_bounded.reshape(B*K*N,3), use_derivative=True)
+            phi_cat = torch.cat([phi.unsqueeze(-1),dphi],dim=-1)
+            phi_cat = phi_cat.reshape(B,K,N,-1,4).transpose(0,1).reshape(K,B*N,-1,4) # K,B*N,-1,4
+
+            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
+
+            output = torch.einsum('ijkl,ik->ijl',phi_cat,weights_near).reshape(K,B,N,4).transpose(0,1).reshape(B*K,N,4)
+            sdf = output[:,:,0]
+            gradient = output[:,:,1:]
+            # sdf
+            sdf = sdf + res_x.norm(dim=-1)
+            sdf = sdf.reshape(B,K,N)
+            sdf_per_link = sdf*(scale.reshape(B,K).unsqueeze(-1))
+            
+            # derivative
+            gradient = res_x + torch.nn.functional.normalize(gradient,dim=-1)
+            gradient = torch.nn.functional.normalize(gradient,dim=-1).float()
+            # gradient = gradient.reshape(B,K,N,3)
+            fk_rotation = fk_trans[:,:3,:3]
+            gradient_per_link = torch.einsum('ijk,ikl->ijl',fk_rotation,gradient.transpose(1,2)).transpose(1,2).reshape(B,K,N,3)
+            
+            return sdf_per_link, gradient_per_link
+
     def get_whole_body_sdf_with_joints_grad_batch(self,x,pose,theta,model,used_links = [0,1,2,3,4,5,6,7,8]):
 
         delta = 0.001
