@@ -22,8 +22,12 @@ CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 class BPSDF():
     def __init__(self, n_func,domain_min,domain_max,robot,device):
         self.n_func = n_func
-        self.domain_min = domain_min
-        self.domain_max = domain_max
+        # Convert domain bounds to tensors on the correct device
+        self.domain_min = torch.tensor(domain_min, device=device, dtype=torch.float32)
+        self.domain_max = torch.tensor(domain_max, device=device, dtype=torch.float32)
+        self.device = device    
+        self.robot = robot
+        self.model_path = os.path.join(CUR_DIR, 'models')
         self.device = device    
         self.robot = robot
         self.model_path = os.path.join(CUR_DIR, 'models')

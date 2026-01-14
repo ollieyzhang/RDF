@@ -127,15 +127,15 @@ class PandaLayer(torch.nn.Module):
             # for i in range(mesh.vertices.shape[0]):
             #     vert_neighour_face = np.where(mesh.faces == i)[0]
             #     vert_area_weight.append(1000000*triangle_areas[vert_neighour_face].mean())
-            temp = torch.ones(mesh.vertices.shape[0], 1).float()
+            temp = torch.ones(mesh.vertices.shape[0], 1, device=self.device, dtype=torch.float32)
             meshes[name] = [
-                torch.cat((torch.FloatTensor(np.array(mesh.vertices)), temp), dim=-1).to(self.device),
+                torch.cat((torch.FloatTensor(np.array(mesh.vertices)).to(self.device), temp), dim=-1),
                 # torch.LongTensor(np.asarray(mesh.faces)).to(self.device),
                 mesh.faces,
                 # torch.FloatTensor(np.asarray(vert_area_weight)).to(self.device),
                 # vert_area_weight,
                 # torch.FloatTensor(mesh.vertex_normals)
-                torch.cat((torch.FloatTensor(np.array(mesh.vertex_normals)), temp), dim=-1).to(self.device).to(torch.float),
+                torch.cat((torch.FloatTensor(np.array(mesh.vertex_normals)).to(self.device), temp), dim=-1),
             ]
         return meshes
 
