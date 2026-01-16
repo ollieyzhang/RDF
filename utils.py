@@ -14,11 +14,36 @@ import glob
 import mesh_to_sdf
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def transform_points(points, trans,device):
-    # transfrom points in SE(3)        points:(N,3)       trans:(B,4,4)
-    B,N = trans.shape[0],points.shape[0]
-    ones = torch.ones([B, N, 1],device =device).float()
-    points_ = torch.cat([points.unsqueeze(0).expand(B,N,3), ones], dim=-1)
+def transform_points(points, trans, device):
+    """
+    Transform points in SE(3)
+    
+    Args:
+        points: (N, 3) or (B, N, 3) - query points
+        trans: (B, 4, 4) - transformation matrices
+        device: torch device
+        
+    Returns:
+        transformed_points: (B, N, 3)
+    """
+    B = trans.shape[0]
+    
+    # Handle both (N, 3) and (B, N, 3) inputs
+    if points.ndim == 2:
+        # (N, 3) -> expand to (B, N, 3)
+        N = points.shape[0]
+        ones = torch.ones([B, N, 1], device=device).float()
+        points_ = torch.cat([points.unsqueeze(0).expand(B, N, 3), ones], dim=-1)
+    elif points.ndim == 3:
+        # (B, N, 3) -> already batched
+        assert points.shape[0] == B, f"Batch size mismatch: points {points.shape[0]} vs trans {B}"
+        N = points.shape[1]
+        ones = torch.ones([B, N, 1], device=device).float()
+        points_ = torch.cat([points, ones], dim=-1)
+    else:
+        raise ValueError(f"Invalid points shape: {points.shape}. Expected (N, 3) or (B, N, 3)")
+    
+    # Apply transformation: (B, 4, 4) @ (B, 4, N) -> (B, 4, N) -> (B, N, 3)
     points_ = torch.matmul(trans, points_.permute(0, 2, 1)).permute(0, 2, 1)
     return points_[:, :, :3].float()
 

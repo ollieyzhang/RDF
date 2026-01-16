@@ -230,71 +230,109 @@ class BPSDF():
             # gradient_value = None
             return sdf_value, gradient_value
 
-    def get_whole_body_per_link_sdf_batch(self,x,pose,theta,model,use_derivative = True, used_links = [0,1,2,3,4,5,6,7,8]):
+    def get_whole_body_per_link_sdf_batch(self, x, pose, theta, model, use_derivative=True, used_links=[0,1,2,3,4,5,6,7,8], paired_batch=False):
         """
-        Get SDF values and gradients for each link separately (instead of just the minimum).
+        Get SDF values and gradients for each link separately.
         
         Args:
-            x: query points (N,3)
+            x: query points
+                - If paired_batch=False: (N,3) points, same for all configs
+                - If paired_batch=True: (B,N,3) different points per config
             pose: base pose transformation (B,4,4)
             theta: joint angles (B,7)
             model: trained SDF model dictionary
             use_derivative: whether to compute gradients
             used_links: list of link indices to compute SDF for
+            paired_batch: if True, each batch has its own points (manipulation planning mode)
+                        if False, all batches query same points (CMA-ES mode)
             
         Returns:
-            sdf_per_link: SDF values for each link (B,K,N) where K is number of links
-            gradient_per_link: gradients for each link (B,K,N,3) or None if use_derivative=False
+            sdf_per_link: SDF values for each link
+                - If paired_batch=False: (B,K,N)
+                - If paired_batch=True: (B,K,N)
+            gradient_per_link: gradients for each link (if use_derivative=True)
+                - If paired_batch=False: (B,K,N,3)
+                - If paired_batch=True: (B,K,N,3)
         """
         B = len(theta)
-        N = len(x)
         K = len(used_links)
-        offset = torch.cat([model[i]['offset'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
-        offset = offset.unsqueeze(0).expand(B,K,3).reshape(B*K,3).float()
-        scale = torch.tensor([model[i]['scale'] for i in used_links],device=self.device)
-        scale = scale.unsqueeze(0).expand(B,K).reshape(B*K).float()
-        trans_list = self.robot.get_transformations_each_link(pose,theta)
-
-        fk_trans = torch.cat([t.unsqueeze(1) for t in trans_list],dim=1)[:,used_links,:,:].reshape(-1,4,4) # B,K,4,4
-        x_robot_frame_batch = utils.transform_points(x.float(),torch.linalg.inv(fk_trans).float(),device=self.device) # B*K,N,3
+        
+        if paired_batch:
+            # Manipulation planning mode: (B, N, 3) -> each config has different points
+            assert x.ndim == 3, "For paired_batch=True, x must be (B, N, 3)"
+            assert x.shape[0] == B, "Batch size mismatch between x and theta"
+            N = x.shape[1]
+            # Flatten to (B*N, 3) for processing
+            x_flat = x.reshape(B * N, 3)
+        else:
+            # CMA-ES mode: (N, 3) -> same points for all configs
+            assert x.ndim == 2, "For paired_batch=False, x must be (N, 3)"
+            N = x.shape[0]
+            x_flat = x  # Already (N, 3), will be broadcast
+        
+        offset = torch.cat([model[i]['offset'].unsqueeze(0) for i in used_links], dim=0).to(self.device)
+        offset = offset.unsqueeze(0).expand(B, K, 3).reshape(B*K, 3).float()
+        scale = torch.tensor([model[i]['scale'] for i in used_links], device=self.device)
+        scale = scale.unsqueeze(0).expand(B, K).reshape(B*K).float()
+        
+        trans_list = self.robot.get_transformations_each_link(pose, theta)
+        fk_trans = torch.cat([t.unsqueeze(1) for t in trans_list], dim=1)[:, used_links, :, :].reshape(-1, 4, 4)
+        
+        if paired_batch:
+            # Transform points: x_flat is (B*N, 3), fk_trans is (B*K, 4, 4)
+            # Need to match dimensions: reshape x to (B, K, N, 3) to broadcast with (B*K) transforms
+            x_reshaped = x_flat.reshape(B, N, 3).unsqueeze(1).expand(B, K, N, 3).reshape(B*K, N, 3)
+            x_robot_frame_batch = utils.transform_points(
+                x_reshaped,  # Now (B*K, N, 3) - already batched per transform
+                torch.linalg.inv(fk_trans).float(),
+                device=self.device
+            )
+        else:
+            # Broadcast same points to all (B*K) transforms
+            x_robot_frame_batch = utils.transform_points(
+                x_flat.float(),
+                torch.linalg.inv(fk_trans).float(),
+                device=self.device
+            )
+        
         x_robot_frame_batch_scaled = x_robot_frame_batch - offset.unsqueeze(1)
-        x_robot_frame_batch_scaled = x_robot_frame_batch_scaled/scale.unsqueeze(-1).unsqueeze(-1) #B*K,N,3
-
-        x_bounded = torch.where(x_robot_frame_batch_scaled>1.0-1e-2,1.0-1e-2,x_robot_frame_batch_scaled)
-        x_bounded = torch.where(x_bounded<-1.0+1e-2,-1.0+1e-2,x_bounded)
+        x_robot_frame_batch_scaled = x_robot_frame_batch_scaled / scale.unsqueeze(-1).unsqueeze(-1)
+        
+        x_bounded = torch.where(x_robot_frame_batch_scaled > 1.0-1e-2, 1.0-1e-2, x_robot_frame_batch_scaled)
+        x_bounded = torch.where(x_bounded < -1.0+1e-2, -1.0+1e-2, x_bounded)
         res_x = x_robot_frame_batch_scaled - x_bounded
-
+        
         if not use_derivative:
-            phi,_ = self.build_basis_function_from_points(x_bounded.reshape(B*K*N,3), use_derivative=False)
-            phi = phi.reshape(B,K,N,-1).transpose(0,1).reshape(K,B*N,-1) # K,B*N,-1
-            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
-            # sdf
-            sdf = torch.einsum('ijk,ik->ij',phi,weights_near).reshape(K,B,N).transpose(0,1).reshape(B*K,N) # B,K,N
-            sdf = sdf + res_x.norm(dim=-1)
-            sdf = sdf.reshape(B,K,N)
-            sdf_per_link = sdf*scale.reshape(B,K).unsqueeze(-1)
-            return sdf_per_link, None
-        else:   
-            phi,dphi = self.build_basis_function_from_points(x_bounded.reshape(B*K*N,3), use_derivative=True)
-            phi_cat = torch.cat([phi.unsqueeze(-1),dphi],dim=-1)
-            phi_cat = phi_cat.reshape(B,K,N,-1,4).transpose(0,1).reshape(K,B*N,-1,4) # K,B*N,-1,4
-
-            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
-
-            output = torch.einsum('ijkl,ik->ijl',phi_cat,weights_near).reshape(K,B,N,4).transpose(0,1).reshape(B*K,N,4)
-            sdf = output[:,:,0]
-            gradient = output[:,:,1:]
-            # sdf
-            sdf = sdf + res_x.norm(dim=-1)
-            sdf = sdf.reshape(B,K,N)
-            sdf_per_link = sdf*(scale.reshape(B,K).unsqueeze(-1))
+            phi, _ = self.build_basis_function_from_points(x_bounded.reshape(B*K*N, 3), use_derivative=False)
+            phi = phi.reshape(B, K, N, -1).transpose(0, 1).reshape(K, B*N, -1)
+            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links], dim=0).to(self.device)
             
-            # derivative
-            gradient = res_x + torch.nn.functional.normalize(gradient,dim=-1)
-            gradient = torch.nn.functional.normalize(gradient,dim=-1).float()
-            # gradient = gradient.reshape(B,K,N,3)
-            fk_rotation = fk_trans[:,:3,:3]
-            gradient_per_link = torch.einsum('ijk,ikl->ijl',fk_rotation,gradient.transpose(1,2)).transpose(1,2).reshape(B,K,N,3)
+            sdf = torch.einsum('ijk,ik->ij', phi, weights_near).reshape(K, B, N).transpose(0, 1).reshape(B*K, N)
+            sdf = sdf + res_x.norm(dim=-1)
+            sdf = sdf.reshape(B, K, N)
+            sdf_per_link = sdf * scale.reshape(B, K).unsqueeze(-1)
+            return sdf_per_link, None
+        else:
+            phi, dphi = self.build_basis_function_from_points(x_bounded.reshape(B*K*N, 3), use_derivative=True)
+            phi_cat = torch.cat([phi.unsqueeze(-1), dphi], dim=-1)
+            phi_cat = phi_cat.reshape(B, K, N, -1, 4).transpose(0, 1).reshape(K, B*N, -1, 4)
+            
+            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links], dim=0).to(self.device)
+            
+            output = torch.einsum('ijkl,ik->ijl', phi_cat, weights_near).reshape(K, B, N, 4).transpose(0, 1).reshape(B*K, N, 4)
+            sdf = output[:, :, 0]
+            gradient = output[:, :, 1:]
+            
+            # SDF
+            sdf = sdf + res_x.norm(dim=-1)
+            sdf = sdf.reshape(B, K, N)
+            sdf_per_link = sdf * (scale.reshape(B, K).unsqueeze(-1))
+            
+            # Gradient
+            gradient = res_x + torch.nn.functional.normalize(gradient, dim=-1)
+            gradient = torch.nn.functional.normalize(gradient, dim=-1).float()
+            fk_rotation = fk_trans[:, :3, :3]
+            gradient_per_link = torch.einsum('ijk,ikl->ijl', fk_rotation, gradient.transpose(1, 2)).transpose(1, 2).reshape(B, K, N, 3)
             
             return sdf_per_link, gradient_per_link
 
